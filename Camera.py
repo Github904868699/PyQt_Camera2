@@ -2,15 +2,13 @@
 
 import os
 import sys
-from pathlib import Path
 import struct
 import ctypes
-import json
 import socketserver
 import threading
 from ctypes import POINTER, byref, cast, c_ubyte
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 
 import time
 import socket
@@ -19,26 +17,40 @@ import socket
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
-# YOLO (onnxruntime)
-try:
-    import onnxruntime as ort
-    ORT_AVAILABLE = True
-    ORT_IMPORT_ERROR = None
-except Exception as exc:
-    ort = None  # type: ignore
-    ORT_AVAILABLE = False
-    ORT_IMPORT_ERROR = exc
-
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtGui import QIcon
 import cv2
 
+from config.loader import CONFIG_PATH, load_config, resource_path
+from inference.onnx_yolo import ORT_AVAILABLE, ORT_IMPORT_ERROR, OnnxYoloModel, list_onnx_models
+from sdk.hik_camera import (
+    HIK_SDK_AVAILABLE,
+    HIK_SDK_IMPORT_ERROR,
+    MV_ACCESS_Exclusive,
+    MV_CC_DEVICE_INFO,
+    MV_CC_DEVICE_INFO_LIST,
+    MV_CC_PIXEL_CONVERT_PARAM,
+    MV_FRAME_OUT_INFO_EX,
+    MV_GIGE_DEVICE,
+    MV_OK,
+    MVCC_INTVALUE,
+    MvCamera,
+    PixelType_Gvsp_BayerBG8,
+    PixelType_Gvsp_BayerGB8,
+    PixelType_Gvsp_BayerGR8,
+    PixelType_Gvsp_BayerRG8,
+    PixelType_Gvsp_BGR8_Packed,
+    PixelType_Gvsp_Mono8,
+    PixelType_Gvsp_RGB8_Packed,
+    PixelType_Gvsp_YUV422_Packed,
+    PixelType_Gvsp_YUV422_YUYV_Packed,
+    _HikSDKGuard,
+)
+
 TARGET_DISPLAY_WIDTH = 1280
 UI_TARGET_FPS = 15.0
 UI_PAINT_FPS = 12.0
-CONFIG_PATH = "config.json"
-
 TRIGGER_REGISTER_ADDR_1 = 0
 TRIGGER_REGISTER_ADDR_2 = 1
 RESULT_REGISTER_ADDR_1 = 2
@@ -49,157 +61,7 @@ PULSE_REGISTER_ADDR_2 = 5
 APP_TITLE = "Camera"
 APP_ICON = "Camera.ico"
 
-# ---------------------- SDK import (HIK MVS) ----------------------
-try:
-    from MvCameraControl_class import MvCamera
-    from CameraParams_header import (
-        MV_CC_DEVICE_INFO,
-        MV_CC_DEVICE_INFO_LIST,
-        MV_FRAME_OUT_INFO_EX,
-        MVCC_INTVALUE,
-        MV_CC_PIXEL_CONVERT_PARAM,
-    )
-    from CameraParams_const import MV_GIGE_DEVICE, MV_ACCESS_Exclusive
-    from PixelType_header import (
-        PixelType_Gvsp_BGR8_Packed,
-        PixelType_Gvsp_RGB8_Packed,
-        PixelType_Gvsp_Mono8,
-        PixelType_Gvsp_BayerRG8,
-        PixelType_Gvsp_BayerBG8,
-        PixelType_Gvsp_BayerGB8,
-        PixelType_Gvsp_BayerGR8,
-        PixelType_Gvsp_YUV422_Packed,
-        PixelType_Gvsp_YUV422_YUYV_Packed,
-    )
-    from MvErrorDefine_const import MV_OK
-
-    HIK_SDK_AVAILABLE = True
-    HIK_SDK_IMPORT_ERROR: Optional[Exception] = None
-except Exception as exc:  # pragma: no cover
-    MvCamera = None  # type: ignore
-    MV_CC_DEVICE_INFO = None  # type: ignore
-    MV_CC_DEVICE_INFO_LIST = None  # type: ignore
-    MV_FRAME_OUT_INFO_EX = None  # type: ignore
-    MVCC_INTVALUE = None  # type: ignore
-    MV_CC_PIXEL_CONVERT_PARAM = None  # type: ignore
-    MV_GIGE_DEVICE = 0  # type: ignore
-    MV_ACCESS_Exclusive = 1  # type: ignore
-    PixelType_Gvsp_BGR8_Packed = 0  # type: ignore
-    PixelType_Gvsp_RGB8_Packed = 0  # type: ignore
-    PixelType_Gvsp_Mono8 = 0  # type: ignore
-    PixelType_Gvsp_BayerRG8 = 0  # type: ignore
-    PixelType_Gvsp_BayerBG8 = 0  # type: ignore
-    PixelType_Gvsp_BayerGB8 = 0  # type: ignore
-    PixelType_Gvsp_BayerGR8 = 0  # type: ignore
-    PixelType_Gvsp_YUV422_Packed = 0  # type: ignore
-    PixelType_Gvsp_YUV422_YUYV_Packed = 0  # type: ignore
-    MV_OK = 0  # type: ignore
-    HIK_SDK_AVAILABLE = False
-    HIK_SDK_IMPORT_ERROR = exc
-
-
-_hik_sdk_lock = threading.Lock()
-_hik_sdk_refcount = 0
-
-
-def _hik_sdk_acquire() -> bool:
-    global _hik_sdk_refcount
-    if not HIK_SDK_AVAILABLE or MvCamera is None:
-        return False
-    with _hik_sdk_lock:
-        if _hik_sdk_refcount == 0:
-            try:
-                ret = MvCamera.MV_CC_Initialize()
-            except Exception as exc:
-                print(f"[HIK] SDK 初始化异常: {exc}")
-                return False
-            if ret != MV_OK:
-                print(f"[HIK] SDK 初始化失败: 0x{ret:08X}")
-                return False
-        _hik_sdk_refcount += 1
-        return True
-
-
-def _hik_sdk_release():
-    global _hik_sdk_refcount
-    if not HIK_SDK_AVAILABLE or MvCamera is None:
-        return
-    with _hik_sdk_lock:
-        if _hik_sdk_refcount <= 0:
-            _hik_sdk_refcount = 0
-            return
-        _hik_sdk_refcount -= 1
-        if _hik_sdk_refcount == 0:
-            try:
-                MvCamera.MV_CC_Finalize()
-            except Exception:
-                pass
-
-
-class _HikSDKGuard:
-    def __enter__(self):
-        self._acquired = _hik_sdk_acquire()
-        return self._acquired
-
-    def __exit__(self, exc_type, exc, tb):
-        if self._acquired:
-            _hik_sdk_release()
-
-
 # ---------------------- Helpers ----------------------
-def resource_path(rel: str) -> str:
-    """打包后获取资源路径（图标等资源）"""
-    base = getattr(sys, "_MEIPASS", Path(__file__).parent)
-    return str(Path(base, rel))
-
-
-def safe_load_json(path: str, default):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-
-def load_config(path: str = CONFIG_PATH) -> Dict:
-    cfg = None
-    search_paths = []
-    if path:
-        search_paths.append(path)
-        res_path = resource_path(path)
-        if res_path != path:
-            search_paths.append(res_path)
-
-    for candidate in search_paths:
-        cfg = safe_load_json(candidate, default=None)
-        if cfg:
-            break
-
-    if not cfg:
-        cfg = {
-            "server": {"host": "0.0.0.0", "port": 502},
-            "class_map": {},
-        }
-    cfg.setdefault("server", {"host": "0.0.0.0", "port": 502})
-    cfg.setdefault("class_map", {})
-    return cfg
-
-
-def list_onnx_models(base_dir: Optional[str] = None) -> List[str]:
-    try:
-        root = Path(base_dir) if base_dir else Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
-    except Exception:
-        root = Path(__file__).parent
-
-    models = []
-    try:
-        for p in sorted(root.glob("*.onnx")):
-            if p.is_file():
-                models.append(str(p))
-    except Exception:
-        pass
-
-    return models
 
 
 def get_local_ip() -> str:
@@ -866,153 +728,6 @@ class UsbGrabber(QtCore.QThread):
             except Exception:
                 pass
         self.cap = None
-
-
-# ---------------------- YOLO (ONNX) ----------------------
-def _nms_boxes(boxes: np.ndarray, scores: np.ndarray, iou_thres: float) -> List[int]:
-    if boxes.size == 0:
-        return []
-    x1 = boxes[:, 0]
-    y1 = boxes[:, 1]
-    x2 = boxes[:, 2]
-    y2 = boxes[:, 3]
-    areas = (x2 - x1 + 1.0) * (y2 - y1 + 1.0)
-    order = scores.argsort()[::-1]
-    keep: List[int] = []
-
-    while order.size > 0:
-        i = int(order[0])
-        keep.append(i)
-        if order.size == 1:
-            break
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-
-        w = np.maximum(0.0, xx2 - xx1 + 1.0)
-        h = np.maximum(0.0, yy2 - yy1 + 1.0)
-        inter = w * h
-        ovr = inter / (areas[i] + areas[order[1:]] - inter)
-
-        inds = np.where(ovr <= iou_thres)[0]
-        order = order[inds + 1]
-
-    return keep
-
-
-class OnnxYoloModel:
-    def __init__(self, model_path: str):
-        if not ORT_AVAILABLE or ort is None:
-            raise RuntimeError(f"onnxruntime 未就绪: {ORT_IMPORT_ERROR}")
-
-        self.model_path = model_path
-        self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-        input_meta = self.session.get_inputs()[0]
-        self.input_name = input_meta.name
-        self.input_shape = input_meta.shape
-        self.input_h, self.input_w = self._resolve_input_shape(input_meta.shape)
-        self.names = self._load_names(model_path)
-
-    @staticmethod
-    def _resolve_input_shape(shape) -> Tuple[int, int]:
-        if isinstance(shape, (list, tuple)) and len(shape) >= 4:
-            h = shape[2] if isinstance(shape[2], int) and shape[2] else 640
-            w = shape[3] if isinstance(shape[3], int) and shape[3] else 640
-            return int(h), int(w)
-        return 640, 640
-
-    @staticmethod
-    def _load_names(model_path: str) -> Dict[int, str]:
-        names_path = Path(model_path).with_suffix(".names")
-        if not names_path.exists():
-            return {}
-        try:
-            lines = [line.strip() for line in names_path.read_text(encoding="utf-8").splitlines()]
-        except Exception:
-            return {}
-        return {idx: name for idx, name in enumerate(lines) if name}
-
-    def _letterbox(self, img: np.ndarray) -> Tuple[np.ndarray, float, float, float]:
-        h, w = img.shape[:2]
-        ratio = min(self.input_w / w, self.input_h / h)
-        new_w = int(round(w * ratio))
-        new_h = int(round(h * ratio))
-        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        pad_w = self.input_w - new_w
-        pad_h = self.input_h - new_h
-        top = pad_h // 2
-        bottom = pad_h - top
-        left = pad_w // 2
-        right = pad_w - left
-        padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
-        return padded, ratio, float(left), float(top)
-
-    def label_for(self, cls_id: int) -> str:
-        return self.names.get(int(cls_id), str(int(cls_id)))
-
-    def predict(self, frame_bgr: np.ndarray, conf_thres: float, iou_thres: float = 0.45):
-        img, ratio, pad_x, pad_y = self._letterbox(frame_bgr)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))[None, ...]
-        outputs = self.session.run(None, {self.input_name: img})
-        preds = outputs[0]
-
-        if preds.ndim == 3:
-            if preds.shape[1] < preds.shape[2]:
-                preds = preds.transpose(0, 2, 1)
-            preds = preds[0]
-        elif preds.ndim == 2:
-            preds = preds
-        else:
-            preds = preds.reshape(-1, preds.shape[-1])
-
-        if preds.shape[-1] == 6:
-            boxes = preds[:, :4]
-            scores = preds[:, 4]
-            cls_ids = preds[:, 5].astype(int)
-        else:
-            boxes = preds[:, :4]
-            scores_all = preds[:, 4:]
-            cls_ids = np.argmax(scores_all, axis=1)
-            scores = scores_all[np.arange(scores_all.shape[0]), cls_ids]
-
-        mask = scores >= float(conf_thres)
-        boxes = boxes[mask]
-        scores = scores[mask]
-        cls_ids = cls_ids[mask]
-
-        if boxes.size == 0:
-            return []
-
-        x_c, y_c, w, h = boxes.T
-        x1 = x_c - w / 2
-        y1 = y_c - h / 2
-        x2 = x_c + w / 2
-        y2 = y_c + h / 2
-        x1 = (x1 - pad_x) / ratio
-        y1 = (y1 - pad_y) / ratio
-        x2 = (x2 - pad_x) / ratio
-        y2 = (y2 - pad_y) / ratio
-
-        x1 = np.clip(x1, 0, frame_bgr.shape[1] - 1)
-        y1 = np.clip(y1, 0, frame_bgr.shape[0] - 1)
-        x2 = np.clip(x2, 0, frame_bgr.shape[1] - 1)
-        y2 = np.clip(y2, 0, frame_bgr.shape[0] - 1)
-
-        final_boxes = np.stack([x1, y1, x2, y2], axis=1)
-        keep = _nms_boxes(final_boxes, scores, iou_thres)
-        results = []
-        for idx in keep:
-            results.append(
-                {
-                    "bbox": final_boxes[idx],
-                    "score": float(scores[idx]),
-                    "cls_id": int(cls_ids[idx]),
-                }
-            )
-        return results
 
 
 # ---------------------- Main UI ----------------------
